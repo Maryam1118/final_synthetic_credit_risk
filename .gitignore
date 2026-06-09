@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/
+ctgan_credit_risk_submission.csv
+synthetic_ctgan_defaults.csv
