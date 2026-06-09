@@ -1,213 +1,3 @@
-from pathlib import Path
-import warnings
-
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-warnings.filterwarnings("ignore")
-
-TARGET = "SeriousDlqin2yrs"
-ID_COLUMNS = ["Unnamed: 0", "Id"]
-DEFAULT_TRAIN_PATH = Path("data/cs-training.csv")
-DEFAULT_TEST_PATH = Path("data/cs-test.csv")
-
-st.set_page_config(page_title="CTGAN Credit Risk AI", layout="wide")
-
-
-def load_credit_data(file_or_path):
-    data = pd.read_csv(file_or_path)
-    data = data.drop(columns=[c for c in ID_COLUMNS if c in data.columns], errors="ignore")
-    return data
-
-
-def clean_data(data, has_target=True):
-    data = data.copy()
-
-    if has_target:
-        if TARGET not in data.columns:
-            raise ValueError(f"Training CSV must contain `{TARGET}` column.")
-        data = data.dropna(subset=[TARGET])
-        data[TARGET] = data[TARGET].astype(int)
-
-    for col in data.columns:
-        if col != TARGET:
-            data[col] = pd.to_numeric(data[col], errors="coerce")
-
-    if "age" in data.columns:
-        data = data[data["age"].fillna(0) > 0]
-
-    return data.reset_index(drop=True)
-
-
-def fallback_synthetic_data(train_df, rows_to_generate):
-    minority_df = train_df[train_df[TARGET] == 1]
-
-    if rows_to_generate <= 0 or minority_df.empty:
-        return pd.DataFrame(columns=train_df.columns), "No synthetic rows needed"
-
-    synthetic_df = minority_df.sample(
-        rows_to_generate,
-        replace=True,
-        random_state=42,
-    ).reset_index(drop=True)
-
-    numeric_cols = [c for c in synthetic_df.columns if c != TARGET]
-
-    for col in numeric_cols:
-        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors="coerce")
-        col_std = synthetic_df[col].std()
-
-        if pd.isna(col_std) or col_std == 0:
-            col_std = 0.01
-
-        noise = np.random.normal(0, col_std * 0.01, len(synthetic_df))
-        synthetic_df[col] = synthetic_df[col] + noise
-
-    synthetic_df[TARGET] = 1
-    return synthetic_df, "Fallback oversampling used because CTGAN could not run on this server"
-
-
-def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
-    from sklearn.compose import ColumnTransformer
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.impute import SimpleImputer
-    from sklearn.metrics import (
-        accuracy_score,
-        average_precision_score,
-        classification_report,
-        confusion_matrix,
-        f1_score,
-        precision_score,
-        recall_score,
-        roc_auc_score,
-    )
-    from sklearn.model_selection import train_test_split
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    data = clean_data(data)
-
-    if sample_limit and len(data) > sample_limit:
-        data = data.sample(sample_limit, random_state=42).reset_index(drop=True)
-
-    features = [c for c in data.columns if c != TARGET]
-
-    train_df, valid_df = train_test_split(
-        data,
-        test_size=0.2,
-        stratify=data[TARGET],
-        random_state=42,
-    )
-
-    counts = train_df[TARGET].value_counts()
-    minority_count = int(counts.get(1, 0))
-    majority_count = int(counts.get(0, 0))
-
-    desired_minority = int((synthetic_ratio * majority_count) / max(1 - synthetic_ratio, 1e-6))
-    rows_to_generate = max(0, desired_minority - minority_count)
-    rows_to_generate = min(rows_to_generate, 200)
-
-    synthetic_status = "CTGAN synthetic data generated successfully"
-
-    try:
-        from sdv.metadata import SingleTableMetadata
-        from sdv.sampling import Condition
-        from sdv.single_table import CTGANSynthesizer
-
-        small_ctgan_train = train_df.sample(
-            min(len(train_df), 500),
-            random_state=42,
-        ).reset_index(drop=True)
-
-        metadata = SingleTableMetadata()
-        metadata.detect_from_dataframe(small_ctgan_train)
-        metadata.update_column(TARGET, sdtype="categorical")
-
-        synthesizer = CTGANSynthesizer(
-            metadata,
-            epochs=ctgan_epochs,
-            batch_size=50,
-            verbose=False,
-            cuda=False,
-        )
-
-        synthesizer.fit(small_ctgan_train)
-
-        if rows_to_generate > 0:
-            condition = Condition({TARGET: 1}, num_rows=rows_to_generate)
-            synthetic_df = synthesizer.sample_from_conditions([condition])
-            synthetic_df[TARGET] = 1
-        else:
-            synthetic_df = pd.DataFrame(columns=train_df.columns)
-
-    except Exception:
-        synthetic_df, synthetic_status = fallback_synthetic_data(train_df, rows_to_generate)
-
-    for col in train_df.columns:
-        if col not in synthetic_df.columns:
-            synthetic_df[col] = np.nan
-
-    synthetic_df = synthetic_df[train_df.columns]
-    augmented_train = pd.concat([train_df, synthetic_df], ignore_index=True)
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            (
-                "num",
-                Pipeline(
-                    steps=[
-                        ("imputer", SimpleImputer(strategy="median")),
-                        ("scaler", StandardScaler()),
-                    ]
-                ),
-                features,
-            )
-        ]
-    )
-
-    model = Pipeline(
-        steps=[
-            ("preprocess", preprocessor),
-            (
-                "classifier",
-                RandomForestClassifier(
-                    n_estimators=150,
-                    min_samples_leaf=10,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-
-    model.fit(augmented_train[features], augmented_train[TARGET])
-
-    probabilities = model.predict_proba(valid_df[features])[:, 1]
-    predictions = (probabilities >= 0.5).astype(int)
-
-    metrics = {
-        "ROC AUC": roc_auc_score(valid_df[TARGET], probabilities),
-        "Average Precision": average_precision_score(valid_df[TARGET], probabilities),
-        "Accuracy": accuracy_score(valid_df[TARGET], predictions),
-        "Precision": precision_score(valid_df[TARGET], predictions, zero_division=0),
-        "Recall": recall_score(valid_df[TARGET], predictions, zero_division=0),
-        "F1": f1_score(valid_df[TARGET], predictions, zero_division=0),
-        "Synthetic Rows": len(synthetic_df),
-    }
-
-    matrix = confusion_matrix(valid_df[TARGET], predictions)
-    report = classification_report(valid_df[TARGET], predictions, zero_division=0)
-
-    return model, features, synthetic_df, valid_df, predictions, metrics, matrix, report, synthetic_status
-
-
-def make_submission(model, features, test_data):
-    test_data = clean_data(test_data.drop(columns=[TARGET], errors="ignore"), has_target=False)
-
-    for col in features:
-        if col not in test_data.columns:
             test_data[col] = np.nan
 
     test_data = test_data[features]
@@ -221,28 +11,48 @@ def make_submission(model, features, test_data):
     )
 
 
-st.title("Synthetic Financial Data Generation for Credit Risk Assessment")
-st.caption("CTGAN-based synthetic data generation and credit default prediction.")
+inject_dark_theme()
+render_hero()
+
+if "use_sample_data" not in st.session_state:
+    st.session_state.use_sample_data = False
 
 with st.sidebar:
-    st.header("Upload Data")
-    uploaded_train = st.file_uploader("Upload cs-training.csv", type=["csv"])
-    uploaded_test = st.file_uploader("Optional cs-test.csv", type=["csv"])
+    st.markdown("## EVOASTRA")
+    st.caption("Synthetic credit-risk AI lab")
+    st.divider()
 
-    st.header("Training Settings")
+    if st.button("Load Sample Data", use_container_width=True):
+        st.session_state.use_sample_data = True
+
+    uploaded_train = st.file_uploader("Upload training CSV", type=["csv"])
+    uploaded_test = st.file_uploader("Optional test CSV", type=["csv"])
+
+    st.divider()
+    st.markdown("### Training Settings")
     sample_limit = st.slider("Training sample size", 200, 2000, 500, 100)
     ctgan_epochs = st.slider("CTGAN epochs", 1, 10, 1, 1)
     synthetic_ratio = st.slider("Target default share", 0.10, 0.30, 0.15, 0.05)
 
-    train_button = st.button("Train CTGAN + Model", type="primary")
+    train_button = st.button("Train CTGAN + Model", type="primary", use_container_width=True)
+
+    st.divider()
+    st.caption("Tip: Streamlit Cloud works best with small CTGAN settings.")
 
 train_source = uploaded_train
 
+if train_source is None and st.session_state.use_sample_data:
+    if DEFAULT_TRAIN_PATH.exists():
+        train_source = DEFAULT_TRAIN_PATH
+    else:
+        st.warning("Sample data was not found. Upload `cs-training.csv` to continue.")
+
 if train_source is None and DEFAULT_TRAIN_PATH.exists():
-    train_source = DEFAULT_TRAIN_PATH
+    st.info("Click **Load Sample Data** in the sidebar, or upload your own training CSV.")
+    st.stop()
 
 if train_source is None:
-    st.info("Upload `cs-training.csv` from the sidebar to start.")
+    st.info("Upload `cs-training.csv` in the sidebar to start.")
     st.stop()
 
 try:
@@ -252,19 +62,43 @@ except Exception as error:
     st.exception(error)
     st.stop()
 
+st.markdown("## Portfolio Overview")
 cols = st.columns(4)
-cols[0].metric("Rows", f"{len(df):,}")
-cols[1].metric("Features", len([c for c in df.columns if c != TARGET]))
-cols[2].metric("Default Rate", f"{df[TARGET].mean():.2%}")
+cols[0].metric("Credit Records", f"{len(df):,}")
+cols[1].metric("Model Features", len([c for c in df.columns if c != TARGET]))
+cols[2].metric("Observed Default Rate", f"{df[TARGET].mean():.2%}")
 cols[3].metric("Missing Values", f"{int(df.isna().sum().sum()):,}")
 
-st.subheader("Dataset Preview")
-st.dataframe(df.head(25), use_container_width=True)
+left, right = st.columns([1.1, 1])
+with left:
+    st.markdown("### Dataset Preview")
+    st.dataframe(df.head(20), use_container_width=True, height=360)
 
-st.subheader("Target Distribution")
-st.bar_chart(df[TARGET].value_counts().sort_index())
+with right:
+    st.markdown("### Target Distribution")
+    distribution = df[TARGET].value_counts().sort_index()
+    chart_df = pd.DataFrame(
+        {
+            "Risk Class": ["No Serious Delinquency", "Serious Delinquency"],
+            "Records": [int(distribution.get(0, 0)), int(distribution.get(1, 0))],
+        }
+    )
+    st.bar_chart(chart_df, x="Risk Class", y="Records", color="#25e0c4")
 
 if not train_button:
+    st.markdown(
+        """
+        <div class="panel">
+            <h3>Ready to Train</h3>
+            <p style="color:#b9adc9;">
+                Use the sidebar controls to tune sample size, CTGAN epochs, and target default share.
+                Click <b>Train CTGAN + Model</b> when you are ready.
+            </p>
+            <p class="status-ok">Cloud-safe defaults are already selected.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 
 with st.spinner("Training CTGAN and credit risk model. Please wait..."):
@@ -273,8 +107,6 @@ with st.spinner("Training CTGAN and credit risk model. Please wait..."):
             model,
             features,
             synthetic_df,
-            valid_df,
-            predictions,
             metrics,
             matrix,
             report,
@@ -288,7 +120,7 @@ with st.spinner("Training CTGAN and credit risk model. Please wait..."):
 st.success("Training complete.")
 st.info(synthetic_status)
 
-st.subheader("Model Metrics")
+st.markdown("## Executive Metrics")
 metric_cols = st.columns(6)
 metric_cols[0].metric("ROC AUC", f"{metrics['ROC AUC']:.3f}")
 metric_cols[1].metric("Avg Precision", f"{metrics['Average Precision']:.3f}")
@@ -299,34 +131,37 @@ metric_cols[5].metric("F1", f"{metrics['F1']:.3f}")
 
 st.metric("Synthetic Rows Generated", f"{metrics['Synthetic Rows']:,}")
 
-st.subheader("Confusion Matrix")
-st.dataframe(
-    pd.DataFrame(
-        matrix,
-        index=["Actual 0", "Actual 1"],
-        columns=["Predicted 0", "Predicted 1"],
-    ),
-    use_container_width=True,
-)
+matrix_col, synthetic_col = st.columns([.9, 1.1])
+with matrix_col:
+    st.markdown("### Confusion Matrix")
+    st.dataframe(
+        pd.DataFrame(
+            matrix,
+            index=["Actual 0", "Actual 1"],
+            columns=["Predicted 0", "Predicted 1"],
+        ),
+        use_container_width=True,
+    )
+
+with synthetic_col:
+    st.markdown("### Synthetic Default Examples")
+    if synthetic_df.empty:
+        st.info("No synthetic rows were generated.")
+    else:
+        st.dataframe(synthetic_df.head(12), use_container_width=True, height=300)
+        st.download_button(
+            "Download Synthetic Data",
+            synthetic_df.to_csv(index=False),
+            "synthetic_ctgan_defaults.csv",
+            "text/csv",
+            use_container_width=True,
+        )
 
 with st.expander("Classification Report"):
     st.code(report)
 
-st.subheader("Synthetic Default Examples")
-if synthetic_df.empty:
-    st.info("No synthetic rows were generated.")
-else:
-    st.dataframe(synthetic_df.head(25), use_container_width=True)
-    st.download_button(
-        "Download Synthetic Data",
-        synthetic_df.to_csv(index=False),
-        "synthetic_ctgan_defaults.csv",
-        "text/csv",
-    )
-
 test_source = uploaded_test
-
-if test_source is None and DEFAULT_TEST_PATH.exists():
+if test_source is None and st.session_state.use_sample_data and DEFAULT_TEST_PATH.exists():
     test_source = DEFAULT_TEST_PATH
 
 if test_source is not None:
@@ -334,7 +169,7 @@ if test_source is not None:
         test_df = pd.read_csv(test_source)
         submission = make_submission(model, features, test_df)
 
-        st.subheader("Prediction Submission")
+        st.markdown("## Prediction Submission")
         st.dataframe(submission.head(25), use_container_width=True)
 
         st.download_button(
@@ -342,7 +177,9 @@ if test_source is not None:
             submission.to_csv(index=False),
             "ctgan_credit_risk_submission.csv",
             "text/csv",
+            use_container_width=True,
         )
     except Exception as error:
         st.error("Could not create test predictions.")
         st.exception(error)
+    
