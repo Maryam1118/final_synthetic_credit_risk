@@ -12,7 +12,6 @@ ID_COLUMNS = ["Unnamed: 0", "Id"]
 DEFAULT_TRAIN_PATH = Path("data/cs-training.csv")
 DEFAULT_TEST_PATH = Path("data/cs-test.csv")
 
-
 st.set_page_config(page_title="CTGAN Credit Risk AI", layout="wide")
 
 
@@ -41,6 +40,34 @@ def clean_data(data, has_target=True):
     return data.reset_index(drop=True)
 
 
+def fallback_synthetic_data(train_df, rows_to_generate):
+    minority_df = train_df[train_df[TARGET] == 1]
+
+    if rows_to_generate <= 0 or minority_df.empty:
+        return pd.DataFrame(columns=train_df.columns), "No synthetic rows needed"
+
+    synthetic_df = minority_df.sample(
+        rows_to_generate,
+        replace=True,
+        random_state=42,
+    ).reset_index(drop=True)
+
+    numeric_cols = [c for c in synthetic_df.columns if c != TARGET]
+
+    for col in numeric_cols:
+        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors="coerce")
+        col_std = synthetic_df[col].std()
+
+        if pd.isna(col_std) or col_std == 0:
+            col_std = 0.01
+
+        noise = np.random.normal(0, col_std * 0.01, len(synthetic_df))
+        synthetic_df[col] = synthetic_df[col] + noise
+
+    synthetic_df[TARGET] = 1
+    return synthetic_df, "Fallback oversampling used because CTGAN could not run on this server"
+
+
 def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
     from sklearn.compose import ColumnTransformer
     from sklearn.ensemble import RandomForestClassifier
@@ -58,9 +85,6 @@ def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
     from sklearn.model_selection import train_test_split
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
-    from sdv.metadata import SingleTableMetadata
-    from sdv.sampling import Condition
-    from sdv.single_table import CTGANSynthesizer
 
     data = clean_data(data)
 
@@ -76,30 +100,55 @@ def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
         random_state=42,
     )
 
-    metadata = SingleTableMetadata()
-    metadata.detect_from_dataframe(train_df)
-    metadata.update_column(TARGET, sdtype="categorical")
-
-    synthesizer = CTGANSynthesizer(
-        metadata,
-        epochs=ctgan_epochs,
-        verbose=False,
-    )
-    synthesizer.fit(train_df)
-
     counts = train_df[TARGET].value_counts()
     minority_count = int(counts.get(1, 0))
     majority_count = int(counts.get(0, 0))
 
     desired_minority = int((synthetic_ratio * majority_count) / max(1 - synthetic_ratio, 1e-6))
-    rows_to_generate = min(max(0, desired_minority - minority_count), 1000)
-    if rows_to_generate > 0:
-        condition = Condition({TARGET: 1}, num_rows=rows_to_generate)
-        synthetic_df = synthesizer.sample_from_conditions([condition])
-        synthetic_df[TARGET] = 1
-    else:
-        synthetic_df = pd.DataFrame(columns=train_df.columns)
+    rows_to_generate = max(0, desired_minority - minority_count)
+    rows_to_generate = min(rows_to_generate, 200)
 
+    synthetic_status = "CTGAN synthetic data generated successfully"
+
+    try:
+        from sdv.metadata import SingleTableMetadata
+        from sdv.sampling import Condition
+        from sdv.single_table import CTGANSynthesizer
+
+        small_ctgan_train = train_df.sample(
+            min(len(train_df), 500),
+            random_state=42,
+        ).reset_index(drop=True)
+
+        metadata = SingleTableMetadata()
+        metadata.detect_from_dataframe(small_ctgan_train)
+        metadata.update_column(TARGET, sdtype="categorical")
+
+        synthesizer = CTGANSynthesizer(
+            metadata,
+            epochs=ctgan_epochs,
+            batch_size=50,
+            verbose=False,
+            cuda=False,
+        )
+
+        synthesizer.fit(small_ctgan_train)
+
+        if rows_to_generate > 0:
+            condition = Condition({TARGET: 1}, num_rows=rows_to_generate)
+            synthetic_df = synthesizer.sample_from_conditions([condition])
+            synthetic_df[TARGET] = 1
+        else:
+            synthetic_df = pd.DataFrame(columns=train_df.columns)
+
+    except Exception:
+        synthetic_df, synthetic_status = fallback_synthetic_data(train_df, rows_to_generate)
+
+    for col in train_df.columns:
+        if col not in synthetic_df.columns:
+            synthetic_df[col] = np.nan
+
+    synthetic_df = synthetic_df[train_df.columns]
     augmented_train = pd.concat([train_df, synthetic_df], ignore_index=True)
 
     preprocessor = ColumnTransformer(
@@ -123,8 +172,8 @@ def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
             (
                 "classifier",
                 RandomForestClassifier(
-                    n_estimators=200,
-                    min_samples_leaf=20,
+                    n_estimators=150,
+                    min_samples_leaf=10,
                     class_weight="balanced",
                     random_state=42,
                     n_jobs=-1,
@@ -151,12 +200,18 @@ def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
     matrix = confusion_matrix(valid_df[TARGET], predictions)
     report = classification_report(valid_df[TARGET], predictions, zero_division=0)
 
-    return model, features, synthetic_df, valid_df, predictions, metrics, matrix, report
+    return model, features, synthetic_df, valid_df, predictions, metrics, matrix, report, synthetic_status
 
 
 def make_submission(model, features, test_data):
     test_data = clean_data(test_data.drop(columns=[TARGET], errors="ignore"), has_target=False)
-    probabilities = model.predict_proba(test_data[features])[:, 1]
+
+    for col in features:
+        if col not in test_data.columns:
+            test_data[col] = np.nan
+
+    test_data = test_data[features]
+    probabilities = model.predict_proba(test_data)[:, 1]
 
     return pd.DataFrame(
         {
@@ -175,9 +230,9 @@ with st.sidebar:
     uploaded_test = st.file_uploader("Optional cs-test.csv", type=["csv"])
 
     st.header("Training Settings")
-    sample_limit = st.slider("Training sample size", 500, 5000, 2000, 500)
-    ctgan_epochs = st.slider("CTGAN epochs", 1, 20, 5, 1)
-    synthetic_ratio = st.slider("Target default share", 0.10, 0.40, 0.20, 0.05)
+    sample_limit = st.slider("Training sample size", 200, 2000, 500, 100)
+    ctgan_epochs = st.slider("CTGAN epochs", 1, 10, 1, 1)
+    synthetic_ratio = st.slider("Target default share", 0.10, 0.30, 0.15, 0.05)
 
     train_button = st.button("Train CTGAN + Model", type="primary")
 
@@ -223,6 +278,7 @@ with st.spinner("Training CTGAN and credit risk model. Please wait..."):
             metrics,
             matrix,
             report,
+            synthetic_status,
         ) = train_credit_model(df, sample_limit, ctgan_epochs, synthetic_ratio)
     except Exception as error:
         st.error("Training failed. Full error:")
@@ -230,6 +286,7 @@ with st.spinner("Training CTGAN and credit risk model. Please wait..."):
         st.stop()
 
 st.success("Training complete.")
+st.info(synthetic_status)
 
 st.subheader("Model Metrics")
 metric_cols = st.columns(6)
@@ -257,7 +314,7 @@ with st.expander("Classification Report"):
 
 st.subheader("Synthetic Default Examples")
 if synthetic_df.empty:
-    st.info("No synthetic rows were needed for this target ratio.")
+    st.info("No synthetic rows were generated.")
 else:
     st.dataframe(synthetic_df.head(25), use_container_width=True)
     st.download_button(
