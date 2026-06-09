@@ -1,5 +1,4 @@
 import argparse
-import os
 import warnings
 from pathlib import Path
 
@@ -90,10 +89,9 @@ def build_classifier(feature_columns, random_state=42):
     )
 
 
-def train_ctgan(real_train, epochs=80, batch_size=500, random_state=42):
+def train_ctgan(real_train, epochs=80, batch_size=500):
     try:
         from sdv.metadata import SingleTableMetadata
-        from sdv.sampling import Condition
         from sdv.single_table import CTGANSynthesizer
     except ImportError as exc:
         raise RuntimeError(
@@ -113,7 +111,7 @@ def train_ctgan(real_train, epochs=80, batch_size=500, random_state=42):
         cuda=False,
     )
     synthesizer.fit(real_train)
-    return synthesizer, Condition({TARGET: 1}, num_rows=1)
+    return synthesizer
 
 
 def generate_synthetic_minority(
@@ -160,11 +158,8 @@ def train_pipeline(
     minority_count = int(counts.get(1, 0))
     majority_count = int(counts.get(0, 0))
 
-    synthesizer, _ = train_ctgan(
-        train_df,
-        epochs=ctgan_epochs,
-        random_state=random_state,
-    )
+    synthesizer = train_ctgan(train_df, epochs=ctgan_epochs)
+
     synthetic_df = generate_synthetic_minority(
         synthesizer,
         minority_count=minority_count,
@@ -173,6 +168,7 @@ def train_pipeline(
     )
 
     augmented_train = pd.concat([train_df, synthetic_df], ignore_index=True)
+
     model = build_classifier(feature_columns, random_state=random_state)
     model.fit(augmented_train[feature_columns], augmented_train[TARGET])
 
@@ -206,8 +202,12 @@ def train_pipeline(
 
 
 def predict_test_file(model, feature_columns, test_df):
-    clean_test = clean_credit_data(test_df.drop(columns=[TARGET], errors="ignore"), has_target=False)
+    clean_test = clean_credit_data(
+        test_df.drop(columns=[TARGET], errors="ignore"),
+        has_target=False,
+    )
     probabilities = model.predict_proba(clean_test[feature_columns])[:, 1]
+
     return pd.DataFrame(
         {
             "Id": np.arange(1, len(clean_test) + 1),
@@ -219,7 +219,6 @@ def predict_test_file(model, feature_columns, test_df):
 def render_streamlit_app():
     st.set_page_config(
         page_title="CTGAN Credit Risk AI",
-        page_icon="CT",
         layout="wide",
     )
 
@@ -241,7 +240,6 @@ def render_streamlit_app():
             max_value=150000,
             value=30000,
             step=5000,
-            help="Lower values train faster. Use 150000 for the full dataset.",
         )
         ctgan_epochs = st.slider("CTGAN epochs", 10, 300, 80, 10)
         synthetic_ratio = st.slider(
@@ -276,17 +274,23 @@ def render_streamlit_app():
 
     if train_button:
         with st.spinner("Training CTGAN and the credit-risk model. This can take a few minutes."):
-            results = train_pipeline(
-                df,
-                synthetic_ratio=synthetic_ratio,
-                ctgan_epochs=ctgan_epochs,
-                sample_limit=sample_limit,
-            )
+            try:
+                results = train_pipeline(
+                    df,
+                    synthetic_ratio=synthetic_ratio,
+                    ctgan_epochs=ctgan_epochs,
+                    sample_limit=sample_limit,
+                )
+            except Exception as exc:
+                st.error("Training failed. Please check that all requirements are installed.")
+                st.exception(exc)
+                return
 
         st.success("Training complete.")
 
         st.subheader("Model Metrics")
         metrics = results["metrics"]
+
         cols = st.columns(6)
         cols[0].metric("ROC AUC", f"{metrics['roc_auc']:.3f}")
         cols[1].metric("Avg Precision", f"{metrics['average_precision']:.3f}")
@@ -329,6 +333,7 @@ def render_streamlit_app():
         test_source = uploaded_test if uploaded_test is not None else (
             DEFAULT_TEST_PATH if DEFAULT_TEST_PATH.exists() else None
         )
+
         if test_source is not None:
             test_df = pd.read_csv(test_source)
             submission = predict_test_file(
@@ -336,6 +341,7 @@ def render_streamlit_app():
                 results["feature_columns"],
                 test_df,
             )
+
             st.subheader("Kaggle-style Submission")
             st.dataframe(submission.head(25), use_container_width=True)
             st.download_button(
@@ -348,6 +354,7 @@ def render_streamlit_app():
 
 def run_cli(args):
     df = load_credit_data(args.train)
+
     results = train_pipeline(
         df,
         synthetic_ratio=args.synthetic_ratio,
@@ -355,7 +362,9 @@ def run_cli(args):
         sample_limit=args.sample_limit,
         random_state=args.random_state,
     )
+
     print("CTGAN credit-risk training complete")
+
     for key, value in results["metrics"].items():
         if isinstance(value, float):
             print(f"{key}: {value:.4f}")
@@ -388,6 +397,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
     if args.cli:
         run_cli(args)
     else:
