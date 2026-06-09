@@ -92,8 +92,7 @@ def train_credit_model(data, sample_limit, ctgan_epochs, synthetic_ratio):
     majority_count = int(counts.get(0, 0))
 
     desired_minority = int((synthetic_ratio * majority_count) / max(1 - synthetic_ratio, 1e-6))
-    rows_to_generate = max(0, desired_minority - minority_count)
-
+    rows_to_generate = min(max(0, desired_minority - minority_count), 1000)
     if rows_to_generate > 0:
         condition = Condition({TARGET: 1}, num_rows=rows_to_generate)
         synthetic_df = synthesizer.sample_from_conditions([condition])
@@ -176,9 +175,9 @@ with st.sidebar:
     uploaded_test = st.file_uploader("Optional cs-test.csv", type=["csv"])
 
     st.header("Training Settings")
-    sample_limit = st.slider("Training sample size", 5000, 150000, 20000, 5000)
-    ctgan_epochs = st.slider("CTGAN epochs", 5, 100, 20, 5)
-    synthetic_ratio = st.slider("Target default share", 0.10, 0.50, 0.30, 0.05)
+    sample_limit = st.slider("Training sample size", 500, 5000, 2000, 500)
+    ctgan_epochs = st.slider("CTGAN epochs", 1, 20, 5, 1)
+    synthetic_ratio = st.slider("Target default share", 0.10, 0.40, 0.20, 0.05)
 
     train_button = st.button("Train CTGAN + Model", type="primary")
 
